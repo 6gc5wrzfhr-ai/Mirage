@@ -1,0 +1,66 @@
+name: Sheridan multi-reference Mirage build
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [sheridan-multireference]
+    paths:
+      - "Sources/CMirage/**"
+      - "Sources/Mirage/**"
+      - "Scripts/build-xcframework.sh"
+      - "Package.swift"
+      - ".github/workflows/build-multireference.yml"
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mirage-multireference-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 180
+    steps:
+      - name: Checkout Mirage and pinned submodules
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ github.ref }}
+          submodules: recursive
+          fetch-depth: 0
+
+      - name: Verify pinned native engine checkout
+        run: |
+          git -C Sources/CMirage/vendor/sd-cpp rev-parse HEAD
+          git -C Sources/CMirage/vendor/qwentts rev-parse HEAD
+
+      - name: Install build tools
+        run: |
+          brew update
+          brew install cmake ninja
+
+      - name: Build macOS, iOS device and simulator XCFramework
+        run: |
+          chmod +x Scripts/build-xcframework.sh
+          ./Scripts/build-xcframework.sh all
+
+      - name: Verify XCFramework slices and public symbols
+        run: |
+          test -d Frameworks/sdcpp.xcframework
+          plutil -lint Frameworks/sdcpp.xcframework/Info.plist
+          xcrun lipo -info Frameworks/sdcpp.xcframework/ios-arm64/libmirage-sdcpp.a || true
+          find Frameworks/sdcpp.xcframework -maxdepth 3 -type f -print
+
+      - name: Swift package build and smoke tests
+        run: |
+          swift build
+          swift test
+
+      - name: Upload generated XCFramework
+        uses: actions/upload-artifact@v4
+        with:
+          name: Mirage-multireference-XCFramework
+          path: Frameworks/sdcpp.xcframework
+          if-no-files-found: error
+          retention-days: 14
