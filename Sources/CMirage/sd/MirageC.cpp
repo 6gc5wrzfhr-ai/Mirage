@@ -41,6 +41,9 @@ void set_last_error(const char* msg) {
 
 struct mirage_ctx {
     sd_ctx_t* sd = nullptr;
+    bool photo_maker_loaded = false;
+    bool ip_adapter_loaded = false;
+    bool clip_vision_loaded = false;
 };
 
 namespace {
@@ -172,6 +175,9 @@ extern "C" mirage_ctx* mirage_ctx_create(const mirage_model_paths* paths) {
 
     auto* ctx = new mirage_ctx();
     ctx->sd = sd;
+    ctx->photo_maker_loaded = paths->photo_maker_path != nullptr;
+    ctx->ip_adapter_loaded = paths->ip_adapter_path != nullptr;
+    ctx->clip_vision_loaded = paths->clip_vision_path != nullptr;
     return ctx;
 }
 
@@ -226,6 +232,14 @@ extern "C" mirage_image* mirage_generate(mirage_ctx* ctx, const mirage_gen_param
         out.data = const_cast<uint8_t*>(image.pixels);
         return out;
     };
+    if (params->identity_image_count > 0 && !ctx->photo_maker_loaded) {
+        set_last_error("mirage_generate: identity_images require PhotoMaker weights in mirage_model_paths");
+        return nullptr;
+    }
+    if (params->ip_adapter_image && (!ctx->ip_adapter_loaded || !ctx->clip_vision_loaded)) {
+        set_last_error("mirage_generate: IP-Adapter image requires both adapter and CLIP-Vision weights");
+        return nullptr;
+    }
     if (params->identity_image_count < 0 || params->reference_image_count < 0 ||
         params->identity_image_count > 16 || params->reference_image_count > 16) {
         set_last_error("mirage_generate: reference image count must be between 0 and 16");
