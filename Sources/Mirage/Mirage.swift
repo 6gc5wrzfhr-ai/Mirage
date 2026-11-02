@@ -376,12 +376,12 @@ public actor Engine {
             }
             return pixels
         }
-        let ipPixels: [UInt8]? = if let image = request.ipAdapterImage {
+        let ipPixels: [UInt8]? = try request.ipAdapterImage.map { image in
             guard let pixels = Self.makeRGB8(from: image) else {
                 throw MirageError.invalidNativeImage("could not convert the IP-Adapter image to RGB8")
             }
-            pixels
-        } else { nil }
+            return pixels
+        }
 
         // Recursion deliberately keeps each pixel array's unsafe buffer alive
         // until the synchronous native generation call has returned.
