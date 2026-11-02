@@ -83,15 +83,25 @@ public struct ModelFiles: Sendable {
     /// vocabulary differs from the one the model expects (Ming-Image's
     /// Ling-mini-2.0, MOSS-Image's Qwen3.5). Nil uses the encoder's own.
     public var tokenizer: URL?
+    /// CLIP-Vision encoder required by IP-Adapter.
+    public var clipVision: URL?
+    /// IP-Adapter or IP-Adapter Plus weights (SD 1.5 / SDXL).
+    public var ipAdapter: URL?
+    /// PhotoMaker weights (documented upstream for SDXL).
+    public var photoMaker: URL?
 
     public init(diffusionModel: URL, vae: URL? = nil, textEncoder: URL? = nil,
-                t5Encoder: URL? = nil, taeDecoder: URL? = nil, tokenizer: URL? = nil) {
+                t5Encoder: URL? = nil, taeDecoder: URL? = nil, tokenizer: URL? = nil,
+                clipVision: URL? = nil, ipAdapter: URL? = nil, photoMaker: URL? = nil) {
         self.diffusionModel = diffusionModel
         self.vae = vae
         self.textEncoder = textEncoder
         self.t5Encoder = t5Encoder
         self.taeDecoder = taeDecoder
         self.tokenizer = tokenizer
+        self.clipVision = clipVision
+        self.ipAdapter = ipAdapter
+        self.photoMaker = photoMaker
     }
 }
 
@@ -121,6 +131,16 @@ public struct GenerationRequest: Sendable {
     public var customSigmas: [Float]? = nil
     /// Flow-matching shift override. Nil keeps the model default.
     public var flowShift: Float? = nil
+    /// Multiple ID photos for PhotoMaker. Requires an SDXL-compatible model
+    /// and PhotoMaker weights configured in ModelFiles.
+    public var identityImages: [CGImage] = []
+    /// One reference image for IP-Adapter / Plus.
+    public var ipAdapterImage: CGImage? = nil
+    public var ipAdapterStrength: Float = 0.8
+    /// Generic reference images; meaning is model-specific in sd.cpp.
+    public var referenceImages: [CGImage] = []
+    public var referenceImageArgs: String? = nil
+    public var photoMakerStyleStrength: Float = 20
 
     public init(
         prompt: String,
@@ -131,7 +151,13 @@ public struct GenerationRequest: Sendable {
         cfgScale: Float = 1.0,
         seed: Int64? = nil,
         customSigmas: [Float]? = nil,
-        flowShift: Float? = nil
+        flowShift: Float? = nil,
+        identityImages: [CGImage] = [],
+        ipAdapterImage: CGImage? = nil,
+        ipAdapterStrength: Float = 0.8,
+        referenceImages: [CGImage] = [],
+        referenceImageArgs: String? = nil,
+        photoMakerStyleStrength: Float = 20
     ) {
         self.prompt = prompt
         self.negativePrompt = negativePrompt
@@ -142,6 +168,12 @@ public struct GenerationRequest: Sendable {
         self.seed = seed
         self.customSigmas = customSigmas
         self.flowShift = flowShift
+        self.identityImages = identityImages
+        self.ipAdapterImage = ipAdapterImage
+        self.ipAdapterStrength = ipAdapterStrength
+        self.referenceImages = referenceImages
+        self.referenceImageArgs = referenceImageArgs
+        self.photoMakerStyleStrength = photoMakerStyleStrength
     }
 }
 
@@ -275,9 +307,12 @@ public actor Engine {
         let t5 = models.t5Encoder?.path
         let tae = models.taeDecoder?.path
         let tokenizer = models.tokenizer?.path
+        let clipVision = models.clipVision?.path
+        let ipAdapter = models.ipAdapter?.path
+        let photoMaker = models.photoMaker?.path
 
-        func withOptionalCString<T>(_ s: String?, _ body: (UnsafePointer<CChar>?) -> T) -> T {
-            if let s = s { return s.withCString { body($0) } }
+        func withOptionalCString<T>(_ value: String?, _ body: (UnsafePointer<CChar>?) -> T) -> T {
+            if let value { return value.withCString { body($0) } }
             return body(nil)
         }
 
@@ -287,16 +322,23 @@ public actor Engine {
                     withOptionalCString(t5) { tPtr in
                         withOptionalCString(tae) { taePtr in
                             withOptionalCString(tokenizer) { tokPtr in
-                                var paths = mirage_model_paths(
-                                    diffusion_model_path: dPtr,
-                                    vae_path: vPtr,
-                                    llm_path: lPtr,
-                                    t5xxl_path: tPtr,
-                                    taesd_path: taePtr,
-                                    tokenizer_path: tokPtr
-                                )
-                                return withUnsafePointer(to: &paths) { pp -> OpaquePointer? in
-                                    mirage_ctx_create(pp)
+                                withOptionalCString(clipVision) { cvPtr in
+                                    withOptionalCString(ipAdapter) { iaPtr in
+                                        withOptionalCString(photoMaker) { pmPtr in
+                                            var paths = mirage_model_paths(
+                                                diffusion_model_path: dPtr,
+                                                vae_path: vPtr,
+                                                llm_path: lPtr,
+                                                t5xxl_path: tPtr,
+                                                taesd_path: taePtr,
+                                                tokenizer_path: tokPtr,
+                                                clip_vision_path: cvPtr,
+                                                ip_adapter_path: iaPtr,
+                                                photo_maker_path: pmPtr
+                                            )
+                                            return withUnsafePointer(to: &paths) { mirage_ctx_create($0) }
+                                        }
+                                    }
                                 }
                             }
                         }
@@ -323,24 +365,72 @@ public actor Engine {
         let negHolder = request.negativePrompt ?? ""
 
         let sigmas = request.customSigmas ?? []
+        let identityPixels = request.identityImages.compactMap { Self.makeRGB8(from: $0) }
+        let referencePixels = request.referenceImages.compactMap { Self.makeRGB8(from: $0) }
+        let ipPixels = request.ipAdapterImage.flatMap { Self.makeRGB8(from: $0) }
+
         let imgPtr: UnsafeMutablePointer<mirage_image>? = promptHolder.withCString { pPtr in
             negHolder.withCString { nPtr in
-                sigmas.withUnsafeBufferPointer { sigmaBuf in
-                    var params = mirage_gen_params(
-                        prompt: pPtr,
-                        negative_prompt: request.negativePrompt == nil ? nil : nPtr,
-                        width: Int32(request.width),
-                        height: Int32(request.height),
-                        steps: Int32(request.steps),
-                        cfg_scale: request.cfgScale,
-                        seed: request.seed ?? -1,
-                        batch_size: 1,
-                        custom_sigmas: sigmas.isEmpty ? nil : sigmaBuf.baseAddress,
-                        custom_sigmas_count: Int32(sigmas.count),
-                        flow_shift: request.flowShift ?? 0
-                    )
-                    return withUnsafePointer(to: &params) { pp in
-                        mirage_generate(self.ctx, pp)
+                func withImageViews<T>(_ body: ([mirage_reference_image], mirage_reference_image?) -> T) -> T {
+                    let identityViews = identityPixels.enumerated().compactMap { index, pixels -> mirage_reference_image? in
+                        guard let base = pixels.withUnsafeBufferPointer({ $0.baseAddress }) else { return nil }
+                        let cg = request.identityImages[index]
+                        return mirage_reference_image(pixels: base, width: Int32(cg.width), height: Int32(cg.height), channels: 3)
+                    }
+                    let referenceViews = referencePixels.enumerated().compactMap { index, pixels -> mirage_reference_image? in
+                        guard let base = pixels.withUnsafeBufferPointer({ $0.baseAddress }) else { return nil }
+                        let cg = request.referenceImages[index]
+                        return mirage_reference_image(pixels: base, width: Int32(cg.width), height: Int32(cg.height), channels: 3)
+                    }
+                    let ipView: mirage_reference_image? = ipPixels.flatMap { pixels in
+                        guard let base = pixels.withUnsafeBufferPointer({ $0.baseAddress }),
+                              let cg = request.ipAdapterImage else { return nil }
+                        return mirage_reference_image(pixels: base, width: Int32(cg.width), height: Int32(cg.height), channels: 3)
+                    }
+                    return body(identityViews + referenceViews, ipView)
+                }
+                return withImageViews { combinedViews, ipView in
+                    let identityCount = identityPixels.count
+                    let referenceCount = referencePixels.count
+                    let identityViews = Array(combinedViews.prefix(identityCount))
+                    let referenceViews = Array(combinedViews.dropFirst(identityCount))
+                    return identityViews.withUnsafeBufferPointer { identityBuf in
+                        referenceViews.withUnsafeBufferPointer { referenceBuf in
+                            sigmas.withUnsafeBufferPointer { sigmaBuf in
+                                func call(_ ip: UnsafePointer<mirage_reference_image>?, _ args: UnsafePointer<CChar>?) -> UnsafeMutablePointer<mirage_image>? {
+                                    var params = mirage_gen_params(
+                                        prompt: pPtr,
+                                        negative_prompt: request.negativePrompt == nil ? nil : nPtr,
+                                        width: Int32(request.width),
+                                        height: Int32(request.height),
+                                        steps: Int32(request.steps),
+                                        cfg_scale: request.cfgScale,
+                                        seed: request.seed ?? -1,
+                                        batch_size: 1,
+                                        custom_sigmas: sigmas.isEmpty ? nil : sigmaBuf.baseAddress,
+                                        custom_sigmas_count: Int32(sigmas.count),
+                                        flow_shift: request.flowShift ?? 0,
+                                        identity_images: identityBuf.baseAddress,
+                                        identity_image_count: Int32(identityBuf.count),
+                                        photo_maker_style_strength: request.photoMakerStyleStrength,
+                                        ip_adapter_image: ip,
+                                        ip_adapter_strength: request.ipAdapterStrength,
+                                        reference_images: referenceBuf.baseAddress,
+                                        reference_image_count: Int32(referenceBuf.count),
+                                        reference_image_args: args
+                                    )
+                                    return withUnsafePointer(to: &params) { mirage_generate(self.ctx, $0) }
+                                }
+                                if let ipView {
+                                    var view = ipView
+                                    return withUnsafePointer(to: &view) { call($0, nil) }
+                                }
+                                if let args = request.referenceImageArgs {
+                                    return args.withCString { call(nil, $0) }
+                                }
+                                return call(nil, nil)
+                            }
+                        }
                     }
                 }
             }
