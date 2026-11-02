@@ -114,6 +114,9 @@ extern "C" mirage_ctx* mirage_ctx_create(const mirage_model_paths* paths) {
     if (paths->t5xxl_path) { p.t5xxl_path = paths->t5xxl_path; }
     if (paths->taesd_path) { p.taesd_path = paths->taesd_path; }
     if (paths->tokenizer_path) { p.tokenizer = paths->tokenizer_path; }
+    if (paths->clip_vision_path) { p.clip_vision_path = paths->clip_vision_path; }
+    if (paths->ip_adapter_path) { p.ip_adapter_path = paths->ip_adapter_path; }
+    if (paths->photo_maker_path) { p.photo_maker_path = paths->photo_maker_path; }
 
     // Memory model (upstream 2026-09 residency rework): module placement is
     // expressed as assignment strings instead of the old boolean knobs.
@@ -209,6 +212,69 @@ extern "C" mirage_image* mirage_generate(mirage_ctx* ctx, const mirage_gen_param
     }
     g.seed = params->seed;
     g.batch_count = params->batch_size > 0 ? params->batch_size : 1;
+
+    // Reference pixel buffers are borrowed for this synchronous call.
+    auto valid_image = [](const mirage_reference_image* image) {
+        return image && image->pixels && image->width > 0 && image->height > 0 &&
+               (image->channels == 3 || image->channels == 4);
+    };
+    auto to_sd_image = [](const mirage_reference_image& image) {
+        sd_image_t out{};
+        out.width = static_cast<uint32_t>(image.width);
+        out.height = static_cast<uint32_t>(image.height);
+        out.channel = static_cast<uint32_t>(image.channels);
+        out.data = const_cast<uint8_t*>(image.pixels);
+        return out;
+    };
+    if (params->identity_image_count < 0 || params->reference_image_count < 0 ||
+        params->identity_image_count > 16 || params->reference_image_count > 16) {
+        set_last_error("mirage_generate: reference image count must be between 0 and 16");
+        return nullptr;
+    }
+    if ((params->identity_image_count > 0 && !params->identity_images) ||
+        (params->reference_image_count > 0 && !params->reference_images)) {
+        set_last_error("mirage_generate: reference image array is missing");
+        return nullptr;
+    }
+    for (int32_t i = 0; i < params->identity_image_count; ++i) {
+        if (!valid_image(&params->identity_images[i])) {
+            set_last_error("mirage_generate: invalid identity image");
+            return nullptr;
+        }
+    }
+    for (int32_t i = 0; i < params->reference_image_count; ++i) {
+        if (!valid_image(&params->reference_images[i])) {
+            set_last_error("mirage_generate: invalid reference image");
+            return nullptr;
+        }
+    }
+    if (params->ip_adapter_image) {
+        if (!valid_image(params->ip_adapter_image)) {
+            set_last_error("mirage_generate: invalid IP-Adapter image");
+            return nullptr;
+        }
+        g.ip_adapter_image = to_sd_image(*params->ip_adapter_image);
+        g.ip_adapter_strength = params->ip_adapter_strength > 0 ? params->ip_adapter_strength : 0.8f;
+    }
+    std::vector<sd_image_t> identity_images;
+    identity_images.reserve(static_cast<size_t>(params->identity_image_count));
+    for (int32_t i = 0; i < params->identity_image_count; ++i)
+        identity_images.push_back(to_sd_image(params->identity_images[i]));
+    if (!identity_images.empty()) {
+        g.pm_params.id_images = identity_images.data();
+        g.pm_params.id_images_count = static_cast<int>(identity_images.size());
+        g.pm_params.style_strength = params->photo_maker_style_strength > 0
+            ? params->photo_maker_style_strength : 20.0f;
+    }
+    std::vector<sd_image_t> reference_images;
+    reference_images.reserve(static_cast<size_t>(params->reference_image_count));
+    for (int32_t i = 0; i < params->reference_image_count; ++i)
+        reference_images.push_back(to_sd_image(params->reference_images[i]));
+    if (!reference_images.empty()) {
+        g.ref_images = reference_images.data();
+        g.ref_images_count = static_cast<int>(reference_images.size());
+        g.ref_image_args = params->reference_image_args;
+    }
 
     sd_image_t* result = nullptr;
     int num_images = 0;
