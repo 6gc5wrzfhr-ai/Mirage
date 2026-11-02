@@ -36,10 +36,21 @@ typedef struct {
     const char* taesd_path;             ///< Optional tiny autoencoder (TAESD/TAEHV, e.g. taew2_2 for Wan 2.2).
                                         ///< When set it replaces the full VAE for decode — ~60× smaller file,
                                         ///< seconds instead of minutes, softer texture.
-    const char* tokenizer_path;         ///< Optional external tokenizer.json for text encoders whose GGUF
-                                        ///< vocabulary differs from the one sd.cpp embeds (Ming-Image's Ling,
-                                        ///< MOSS-Image's Qwen3.5). NULL = the encoder's own tokenizer.
+    const char* tokenizer_path;         ///< Optional external tokenizer.json.
+    const char* clip_vision_path;       ///< Optional CLIP-Vision encoder for IP-Adapter.
+    const char* ip_adapter_path;        ///< Optional IP-Adapter / IP-Adapter Plus weights.
+    const char* photo_maker_path;       ///< Optional PhotoMaker weights (SDXL pipeline).
 } mirage_model_paths;
+
+/** Borrowed image pixels. Data remains owned by the caller and must stay
+ * valid until mirage_generate returns. Pixels are tightly packed RGB or RGBA.
+ */
+typedef struct {
+    const uint8_t* pixels;
+    int32_t width;
+    int32_t height;
+    int32_t channels;                   ///< 3 (RGB) or 4 (RGBA).
+} mirage_reference_image;
 
 // MARK: - Generation parameters
 
@@ -57,6 +68,14 @@ typedef struct {
                                         ///< NULL = the model's default scheduler. Borrowed for the call.
     int32_t custom_sigmas_count;
     float   flow_shift;                 ///< Flow-matching shift override. <= 0 keeps the model default.
+    const mirage_reference_image* identity_images; ///< PhotoMaker ID images (SDXL only).
+    int32_t identity_image_count;
+    float photo_maker_style_strength;   ///< PhotoMaker style strength; 0 uses engine default.
+    const mirage_reference_image* ip_adapter_image; ///< Single IP-Adapter reference image.
+    float ip_adapter_strength;         ///< 0 uses the bridge default.
+    const mirage_reference_image* reference_images; ///< Generic model reference images; semantics are model-specific.
+    int32_t reference_image_count;
+    const char* reference_image_args;  ///< sd.cpp ref_image_args; model-specific.
 } mirage_gen_params;
 
 /// One generated image as a tightly-packed RGBA8 buffer the Swift side can
