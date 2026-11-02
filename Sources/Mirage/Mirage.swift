@@ -363,74 +363,99 @@ public actor Engine {
     public func generate(_ request: GenerationRequest) async throws -> CGImage {
         let promptHolder = request.prompt
         let negHolder = request.negativePrompt ?? ""
-
         let sigmas = request.customSigmas ?? []
-        let identityPixels = request.identityImages.compactMap { Self.makeRGB8(from: $0) }
-        let referencePixels = request.referenceImages.compactMap { Self.makeRGB8(from: $0) }
-        let ipPixels = request.ipAdapterImage.flatMap { Self.makeRGB8(from: $0) }
+        let identityPixels = try request.identityImages.map { image -> [UInt8] in
+            guard let pixels = Self.makeRGB8(from: image) else {
+                throw MirageError.invalidNativeImage("could not convert a PhotoMaker identity image to RGB8")
+            }
+            return pixels
+        }
+        let referencePixels = try request.referenceImages.map { image -> [UInt8] in
+            guard let pixels = Self.makeRGB8(from: image) else {
+                throw MirageError.invalidNativeImage("could not convert a reference image to RGB8")
+            }
+            return pixels
+        }
+        let ipPixels: [UInt8]? = if let image = request.ipAdapterImage {
+            guard let pixels = Self.makeRGB8(from: image) else {
+                throw MirageError.invalidNativeImage("could not convert the IP-Adapter image to RGB8")
+            }
+            pixels
+        } else { nil }
+
+        // Recursion deliberately keeps each pixel array's unsafe buffer alive
+        // until the synchronous native generation call has returned.
+        func withViews<T>(
+            _ pixels: [[UInt8]], _ images: [CGImage], _ index: Int = 0,
+            _ accumulated: [mirage_reference_image] = [],
+            _ body: (UnsafeBufferPointer<mirage_reference_image>) -> T
+        ) -> T {
+            guard index < pixels.count else {
+                return accumulated.withUnsafeBufferPointer(body)
+            }
+            return pixels[index].withUnsafeBufferPointer { bytes in
+                guard let base = bytes.baseAddress else {
+                    return withViews(pixels, images, index + 1, accumulated, body)
+                }
+                var next = accumulated
+                next.append(mirage_reference_image(
+                    pixels: base, width: Int32(images[index].width),
+                    height: Int32(images[index].height), channels: 3
+                ))
+                return withViews(pixels, images, index + 1, next, body)
+            }
+        }
 
         let imgPtr: UnsafeMutablePointer<mirage_image>? = promptHolder.withCString { pPtr in
             negHolder.withCString { nPtr in
-                func withImageViews<T>(_ body: ([mirage_reference_image], mirage_reference_image?) -> T) -> T {
-                    let identityViews = identityPixels.enumerated().compactMap { index, pixels -> mirage_reference_image? in
-                        guard let base = pixels.withUnsafeBufferPointer({ $0.baseAddress }) else { return nil }
-                        let cg = request.identityImages[index]
-                        return mirage_reference_image(pixels: base, width: Int32(cg.width), height: Int32(cg.height), channels: 3)
-                    }
-                    let referenceViews = referencePixels.enumerated().compactMap { index, pixels -> mirage_reference_image? in
-                        guard let base = pixels.withUnsafeBufferPointer({ $0.baseAddress }) else { return nil }
-                        let cg = request.referenceImages[index]
-                        return mirage_reference_image(pixels: base, width: Int32(cg.width), height: Int32(cg.height), channels: 3)
-                    }
-                    let ipView: mirage_reference_image? = ipPixels.flatMap { pixels in
-                        guard let base = pixels.withUnsafeBufferPointer({ $0.baseAddress }),
-                              let cg = request.ipAdapterImage else { return nil }
-                        return mirage_reference_image(pixels: base, width: Int32(cg.width), height: Int32(cg.height), channels: 3)
-                    }
-                    return body(identityViews + referenceViews, ipView)
-                }
-                return withImageViews { combinedViews, ipView in
-                    let identityCount = identityPixels.count
-                    let referenceCount = referencePixels.count
-                    let identityViews = Array(combinedViews.prefix(identityCount))
-                    let referenceViews = Array(combinedViews.dropFirst(identityCount))
-                    return identityViews.withUnsafeBufferPointer { identityBuf in
-                        referenceViews.withUnsafeBufferPointer { referenceBuf in
+                withViews(identityPixels, request.identityImages) { identityViews in
+                    withViews(referencePixels, request.referenceImages) { referenceViews in
+                        func call(
+                            _ ip: UnsafePointer<mirage_reference_image>?,
+                            _ args: UnsafePointer<CChar>?
+                        ) -> UnsafeMutablePointer<mirage_image>? {
                             sigmas.withUnsafeBufferPointer { sigmaBuf in
-                                func call(_ ip: UnsafePointer<mirage_reference_image>?, _ args: UnsafePointer<CChar>?) -> UnsafeMutablePointer<mirage_image>? {
-                                    var params = mirage_gen_params(
-                                        prompt: pPtr,
-                                        negative_prompt: request.negativePrompt == nil ? nil : nPtr,
-                                        width: Int32(request.width),
-                                        height: Int32(request.height),
-                                        steps: Int32(request.steps),
-                                        cfg_scale: request.cfgScale,
-                                        seed: request.seed ?? -1,
-                                        batch_size: 1,
-                                        custom_sigmas: sigmas.isEmpty ? nil : sigmaBuf.baseAddress,
-                                        custom_sigmas_count: Int32(sigmas.count),
-                                        flow_shift: request.flowShift ?? 0,
-                                        identity_images: identityBuf.baseAddress,
-                                        identity_image_count: Int32(identityBuf.count),
-                                        photo_maker_style_strength: request.photoMakerStyleStrength,
-                                        ip_adapter_image: ip,
-                                        ip_adapter_strength: request.ipAdapterStrength,
-                                        reference_images: referenceBuf.baseAddress,
-                                        reference_image_count: Int32(referenceBuf.count),
-                                        reference_image_args: args
-                                    )
-                                    return withUnsafePointer(to: &params) { mirage_generate(self.ctx, $0) }
-                                }
-                                if let ipView {
-                                    var view = ipView
-                                    return withUnsafePointer(to: &view) { call($0, nil) }
-                                }
-                                if let args = request.referenceImageArgs {
-                                    return args.withCString { call(nil, $0) }
-                                }
-                                return call(nil, nil)
+                                var params = mirage_gen_params(
+                                    prompt: pPtr,
+                                    negative_prompt: request.negativePrompt == nil ? nil : nPtr,
+                                    width: Int32(request.width),
+                                    height: Int32(request.height),
+                                    steps: Int32(request.steps),
+                                    cfg_scale: request.cfgScale,
+                                    seed: request.seed ?? -1,
+                                    batch_size: 1,
+                                    custom_sigmas: sigmas.isEmpty ? nil : sigmaBuf.baseAddress,
+                                    custom_sigmas_count: Int32(sigmas.count),
+                                    flow_shift: request.flowShift ?? 0,
+                                    identity_images: identityViews.baseAddress,
+                                    identity_image_count: Int32(identityViews.count),
+                                    photo_maker_style_strength: request.photoMakerStyleStrength,
+                                    ip_adapter_image: ip,
+                                    ip_adapter_strength: request.ipAdapterStrength,
+                                    reference_images: referenceViews.baseAddress,
+                                    reference_image_count: Int32(referenceViews.count),
+                                    reference_image_args: args
+                                )
+                                return withUnsafePointer(to: &params) { mirage_generate(self.ctx, $0) }
                             }
                         }
+                        func callWithOptionalArgs(_ ip: UnsafePointer<mirage_reference_image>?) -> UnsafeMutablePointer<mirage_image>? {
+                            guard let args = request.referenceImageArgs else { return call(ip, nil) }
+                            return args.withCString { call(ip, $0) }
+                        }
+                        if let ipPixels {
+                            return ipPixels.withUnsafeBufferPointer { bytes in
+                                guard let base = bytes.baseAddress, let image = request.ipAdapterImage else {
+                                    return callWithOptionalArgs(nil)
+                                }
+                                var view = mirage_reference_image(
+                                    pixels: base, width: Int32(image.width),
+                                    height: Int32(image.height), channels: 3
+                                )
+                                return withUnsafePointer(to: &view) { callWithOptionalArgs($0) }
+                            }
+                        }
+                        return callWithOptionalArgs(nil)
                     }
                 }
             }
